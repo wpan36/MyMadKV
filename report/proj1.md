@@ -89,15 +89,42 @@ The use of a single mutex makes each RPC atomic and prevents interleaving inside
 
 ### Comments
 
-The single-client experiment compares workloads A through F. Workloads dominated by point reads and updates mainly measure one synchronous gRPC round trip plus one logarithmic map operation. Workload E performs range scans and returns multiple key-value pairs, so it has additional map traversal, protobuf construction, serialization, and network-transfer costs. Workload F performs read-modify-write behavior and therefore requires more logical work than a simple point read.
+### Comments
 
-For the scalability experiments, workloads A, C, and E were run with 1, 2, 4, and 8 client processes. Increasing the number of clients creates more outstanding RPCs, which can initially improve aggregate throughput by keeping the server and network busy. However, every handler eventually competes for the same global mutex. Once that serialized critical section becomes the bottleneck, adding clients mainly increases queueing rather than useful parallel execution.
+The single-client results show that workloads A and B achieved the highest
+throughput, at approximately 2,000 operations per second. Workloads C, D,
+and F achieved lower but comparable throughput, while workload E was clearly
+the slowest at approximately 900 operations per second.
 
-Workload C contains only reads, but reads also acquire the exclusive mutex in this implementation. As a result, multiple readers cannot execute concurrently. Workload A combines reads and updates and experiences the same serialization. Workload E is especially sensitive because a Scan holds the mutex while iterating over a range and constructing the response, which can delay all other requests.
+Workload E also had the highest average and p99 latency. This is expected
+because its Scan operations traverse multiple ordered entries, construct
+repeated protobuf messages, and transfer larger responses. In comparison,
+point reads and updates usually require one map lookup or modification and
+a much smaller RPC response.
 
-The latency trend follows queueing behavior: as more clients submit requests concurrently, each request may wait longer to acquire the mutex. Therefore, average latency rises once the server approaches its maximum serialized service rate. The principal scalability bottleneck is the single global lock, followed by synchronous unary RPC overhead and response serialization for scans.
+For workloads A, C, and E, aggregate throughput increased almost linearly
+from one to eight clients. Workload A increased from approximately 2,000 to
+14,000 operations per second, workload C increased from approximately 1,600
+to 14,500 operations per second, and workload E increased from approximately
+900 to 5,900 operations per second.
 
-These experiments cover the required single-client A–F measurements and multi-client A, C, and E scalability measurements.
+This indicates that a single client did not fully utilize the server and
+network. Multiple client processes allowed RPC processing, network activity,
+and work outside the map critical section to overlap. Although all map
+operations use one global mutex, the serialized section was not yet the
+dominant throughput bottleneck within the tested range of up to eight
+clients.
+
+The average latency of workload A remained relatively stable as the number
+of clients increased. Workload C latency decreased slightly, which may be
+caused by warm caches, scheduling effects, or measurement variation.
+Workload E Scan latency increased moderately with more clients because scans
+hold the mutex longer and serialize larger responses.
+
+The results do not prove that the implementation scales indefinitely.
+With client counts beyond eight, the global mutex is expected eventually to
+limit throughput and increase queueing latency. Additional experiments with
+more clients would be needed to identify that saturation point.
 
 ## Additional Discussion
 
