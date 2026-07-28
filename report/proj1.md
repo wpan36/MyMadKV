@@ -12,7 +12,7 @@ The server implementation contains the in-memory key-value store and the gRPC se
 
 The server stores all entries in a `std::map<std::string, std::string>`. A map was selected because it maintains keys in lexicographic order, allowing Get, Put, Swap, and Delete in logarithmic time and supporting ordered range scans through `lower_bound`.
 
-The gRPC server may execute handlers concurrently, so every operation acquires one global `std::mutex`. The mutex protects both individual map operations and the complete Scan operation. Therefore, every RPC has one atomic critical section and all completed operations can be placed in a single global order. This provides the linearizable behavior required by the project, at the cost of serializing all clients. The project specifies an in-memory service without durability and requires a globally ordered view of completed requests. :contentReference[oaicite:0]{index=0}
+The gRPC server may execute handlers concurrently, so every operation acquires one global `std::mutex`. The mutex protects both individual map operations and the complete Scan operation. Therefore, every RPC has one atomic critical section and all completed operations can be placed in a single global order. This provides the linearizable behavior required by the project, at the cost of serializing all clients. The project specifies an in-memory service without durability and requires a globally ordered view of completed requests.
 
 ### RPC Protocol
 
@@ -24,9 +24,9 @@ The service uses five synchronous unary RPCs:
 - `Scan(start_key, end_key)` returns an ordered repeated list of key-value pairs whose keys are in the inclusive range.
 - `Delete(key)` removes the key and returns whether it existed.
 
-Replies use a separate presence indicator where necessary so that a missing key can be distinguished from an existing key whose value is an empty string. Scan returns repeated key-value messages in dictionary order. These semantics match the required Project 1 API. :contentReference[oaicite:1]{index=1}
+Replies use a separate presence indicator where necessary so that a missing key can be distinguished from an existing key whose value is an empty string. Scan returns repeated key-value messages in dictionary order. These semantics match the required Project 1 API.
 
-The client creates a gRPC stub connected to the address supplied through the Justfile recipe. Each input command causes one blocking RPC. After the reply arrives, the client prints one result before reading the next command. This preserves the input/output ordering required by the automated runner. The required stdin/stdout command format is described in the project specification. :contentReference[oaicite:2]{index=2}
+The client creates a gRPC stub connected to the address supplied through the Justfile recipe. Each input command causes one blocking RPC. After the reply arrives, the client prints one result before reading the next command. This preserves the input/output ordering required by the automated runner. The required stdin/stdout command format is described in the project specification.
 
 ## Self-provided Testcases
 
@@ -51,7 +51,7 @@ Two clients access the same key. FIFO synchronization ensures that one client fi
 **Testcase 5 — concurrent deletion and recreation.**  
 Multiple clients operate on the same key through Delete, Get, Put, and Swap. The test verifies that an acknowledged deletion becomes visible to another client and that a later recreation or Swap is also observed correctly.
 
-Together, the tests cover the required two single-client cases, one non-conflicting concurrent case, and two interfering concurrent cases. :contentReference[oaicite:3]{index=3}
+Together, the tests cover the required two single-client cases, one non-conflicting concurrent case, and two interfering concurrent cases.
 
 ## Fuzz Testing
 
@@ -97,7 +97,7 @@ Workload C contains only reads, but reads also acquire the exclusive mutex in th
 
 The latency trend follows queueing behavior: as more clients submit requests concurrently, each request may wait longer to acquire the mutex. Therefore, average latency rises once the server approaches its maximum serialized service rate. The principal scalability bottleneck is the single global lock, followed by synchronous unary RPC overhead and response serialization for scans.
 
-These experiments cover the required single-client A–F measurements and multi-client A, C, and E scalability measurements. :contentReference[oaicite:4]{index=4}
+These experiments cover the required single-client A–F measurements and multi-client A, C, and E scalability measurements.
 
 ## Additional Discussion
 
