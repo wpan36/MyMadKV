@@ -1,2 +1,11 @@
 # CMake build outputs
 kvstore/in_memory_kvstore/build/
+# Build artifacts
+target/
+kvstore/in_memory_kvstore/build/
+
+# Downloaded benchmark dependency
+ycsb/
+
+# Temporary files
+*.log

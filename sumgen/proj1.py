@@ -90,7 +90,7 @@ def expect_configurations():
         cprint(f"  {head:22s}", "cyan", end="")
         print(f"  just p1::bench 1 {wload} <server_addr>")
     for wload in ["a", "c", "e"]:
-        for nclis in [10, 25, 40, 55, 70, 85]:
+        for nclis in [2, 4, 8]:
             head = f"[ycsb-{wload} {nclis} clis]"
             cprint(f"  {head:22s}", "cyan", end="")
             print(f"  just p1::bench {nclis} {wload} <server_addr>")
@@ -220,7 +220,7 @@ def load_bench_results(result_dir, report_dir):
     results["ycsb-single-cli"] = "plots-p1/ycsb-single-cli.png"
 
     # tput-trend
-    nclis_list = [1, 10, 25, 40, 55, 70, 85]
+    nclis_list = [1, 2, 4, 8]
     tputs, wlats = dict(), dict()
     for wload in ["a", "c", "e"]:
         tputs[wload] = []
