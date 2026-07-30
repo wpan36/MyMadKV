@@ -1,2 +1,29 @@
-# CMake build outputs
+# Build output
+kvstore/partitioned_kvstore/build/
+target/
+cmake-build-*/
+compile_commands.json
+
+# Local durable storage
+backer*/
+*.backer/
+madkv-data/
+data/server-*
+
+# Local test and benchmark artifacts
+/tmp/madkv-p2/
+benchmark_results/
+*.out
+*.err
+
+# Python / editors
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.idea/
+.DS_Store
+
+# C++ build directories
 kvstore/in_memory_kvstore/build/
+kvstore/partitioned_kvstore/build/

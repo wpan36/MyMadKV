@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package madkv.cluster;
+
+enum PartitioningScheme {
+  PARTITIONING_SCHEME_UNSPECIFIED = 0;
+  PARTITIONING_SCHEME_FNV1A_64_MOD_N = 1;
+}
+
+message ServerInfo {
+  uint32 server_id = 1;
+  string address = 2;
+  bool registered = 3;
+}
+
+message ClusterConfig {
+  uint32 server_count = 1;
+  PartitioningScheme partitioning_scheme = 2;
+  repeated ServerInfo servers = 3;
+  bool ready = 4;
+}
+
+message RegisterServerRequest {
+  uint32 server_id = 1;
+  string address = 2;
+}
+
+message RegisterServerReply {
+  ClusterConfig config = 1;
+}
+
+message GetClusterRequest {
+}
+
+message GetClusterReply {
+  ClusterConfig config = 1;
+}
+
+service ClusterManager {
+  rpc RegisterServer(RegisterServerRequest)
+      returns (RegisterServerReply);
+
+  rpc GetCluster(GetClusterRequest)
+      returns (GetClusterReply);
+}

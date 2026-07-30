@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package madkv.storage;
+
+enum MutationType {
+  MUTATION_TYPE_UNSPECIFIED = 0;
+  MUTATION_TYPE_PUT = 1;
+  MUTATION_TYPE_SWAP = 2;
+  MUTATION_TYPE_DELETE = 3;
+}
+
+message DurableCommand {
+  // Existing fields: their numbers must remain stable so that
+  // previously persisted logs remain readable.
+  uint64 sequence = 1;
+  MutationType type = 2;
+  string key = 3;
+  string value = 4;
+
+  // Retry identity.
+  string client_id = 5;
+  uint64 request_id = 6;
+
+  // Original reply persisted with the command.
+  bool reply_found = 7;
+  string reply_value = 8;
+}
