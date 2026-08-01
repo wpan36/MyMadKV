@@ -93,7 +93,7 @@ bool CallWithRetry(
         grpc::ClientContext context;
 
         context.set_deadline(
-            std::chrono::system_clock::now() + 1s
+            std::chrono::system_clock::now() + 10s
         );
 
         Reply attempt_reply;

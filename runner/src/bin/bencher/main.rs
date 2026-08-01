@@ -13,7 +13,7 @@ use runner::{ClientProc, RunnerError};
 // Hardcoded constants:
 const VALID_WORKLOADS: [char; 6] = ['a', 'b', 'c', 'd', 'e', 'f'];
 const RESP_TIMEOUT: Duration = Duration::from_secs(60);
-const YCSB_TIMEOUT: Duration = Duration::from_secs(600);
+const YCSB_TIMEOUT: Duration = Duration::from_secs(1200);
 
 mod ycsb;
 use ycsb::*;
