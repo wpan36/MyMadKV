@@ -478,3 +478,83 @@ target_compile_options(
         -Wextra
         -Wpedantic
 )
+# ---------------------------------------------------------------------------
+# Project 3 Step 4: Raft-backed KV state machine
+# ---------------------------------------------------------------------------
+
+add_library(
+    replicated_kv_service
+    replicated_kv_service.cc
+)
+
+target_include_directories(
+    replicated_kv_service
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        "${GENERATED_DIR}"
+)
+
+target_link_libraries(
+    replicated_kv_service
+    PUBLIC
+        p2_core
+        kv_proto
+        raft_core
+)
+
+target_compile_options(
+    replicated_kv_service
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
+# Temporary Step-4 integration server. Step 5 will wire the same
+# ReplicatedKVService into the real kv_server using manager topology.
+add_executable(
+    raft_kv_demo_server
+    raft_kv_demo_server.cc
+)
+
+target_link_libraries(
+    raft_kv_demo_server
+    PRIVATE
+        replicated_kv_service
+)
+
+target_compile_options(
+    raft_kv_demo_server
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
+# Tiny direct client for Step-4 integration testing without manager/client
+# topology logic. It is intentionally not the final Project-3 client.
+add_executable(
+    kv_direct_client_demo
+    kv_direct_client_demo.cc
+)
+
+target_include_directories(
+    kv_direct_client_demo
+    PRIVATE
+        "${GENERATED_DIR}"
+)
+
+target_link_libraries(
+    kv_direct_client_demo
+    PRIVATE
+        kv_proto
+)
+
+target_compile_options(
+    kv_direct_client_demo
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)

@@ -7,6 +7,8 @@ enum MutationType {
   MUTATION_TYPE_PUT = 1;
   MUTATION_TYPE_SWAP = 2;
   MUTATION_TYPE_DELETE = 3;
+  // P3: a replicated no-op used as a linearizable read barrier.
+  MUTATION_TYPE_NOOP = 4;
 }
 
 message DurableCommand {
