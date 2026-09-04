@@ -364,3 +364,117 @@ target_compile_options(
         -Wextra
         -Wpedantic
 )
+# ---------------------------------------------------------------------------
+# Project 3 Raft support
+# ---------------------------------------------------------------------------
+
+set(
+    RAFT_PROTO_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/raft.proto"
+)
+
+set(
+    RAFT_PROTO_SOURCES
+    "${GENERATED_DIR}/raft.pb.cc"
+    "${GENERATED_DIR}/raft.grpc.pb.cc"
+)
+
+set(
+    RAFT_PROTO_HEADERS
+    "${GENERATED_DIR}/raft.pb.h"
+    "${GENERATED_DIR}/raft.grpc.pb.h"
+)
+
+add_custom_command(
+    OUTPUT
+        ${RAFT_PROTO_SOURCES}
+        ${RAFT_PROTO_HEADERS}
+
+    COMMAND
+        "${PROTOC_EXECUTABLE}"
+
+    ARGS
+        "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}"
+        "--cpp_out=${GENERATED_DIR}"
+        "--grpc_out=${GENERATED_DIR}"
+        "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXECUTABLE}"
+        "${RAFT_PROTO_FILE}"
+
+    DEPENDS
+        "${RAFT_PROTO_FILE}"
+
+    COMMENT
+        "Generating Raft protobuf and gRPC sources"
+
+    VERBATIM
+)
+
+add_library(
+    raft_proto
+    ${RAFT_PROTO_SOURCES}
+    ${RAFT_PROTO_HEADERS}
+)
+
+target_include_directories(
+    raft_proto
+    PUBLIC
+        "${GENERATED_DIR}"
+)
+
+target_link_libraries(
+    raft_proto
+    PUBLIC
+        PkgConfig::GRPCPP
+        protobuf::libprotobuf
+)
+
+add_library(
+    raft_core
+    raft_storage.cc
+    raft_node.cc
+)
+
+target_include_directories(
+    raft_core
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${GENERATED_DIR}"
+        "${ROCKSDB_INCLUDE_DIR}"
+)
+
+target_link_libraries(
+    raft_core
+    PUBLIC
+        raft_proto
+        "${ROCKSDB_LIBRARY}"
+        Threads::Threads
+)
+
+target_compile_options(
+    raft_core
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
+# Temporary development executable used only to validate Raft election and
+# persistent term/vote state before the KV server is wired into Raft.
+add_executable(
+    raft_election_demo
+    raft_election_demo.cc
+)
+
+target_link_libraries(
+    raft_election_demo
+    PRIVATE
+        raft_core
+)
+
+target_compile_options(
+    raft_election_demo
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
