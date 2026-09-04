@@ -39,10 +39,11 @@ RaftNode::RaftNode(
         config_.election_timeout_min.count() <= 0 ||
         config_.election_timeout_max <= config_.election_timeout_min ||
         config_.heartbeat_interval.count() <= 0 ||
-        config_.rpc_timeout.count() <= 0
+        config_.rpc_timeout.count() <= 0 ||
+        config_.max_entries_per_append == 0
     ) {
         throw std::invalid_argument(
-            "Invalid Raft timeout configuration"
+            "Invalid Raft timeout/batch configuration"
         );
     }
 
@@ -194,6 +195,7 @@ void RaftNode::Stop() {
     std::lock_guard<std::mutex> lock(mutex_);
     server_.reset();
     started_ = false;
+    cv_.notify_all();
 }
 
 bool RaftNode::IsLeader() const {
@@ -214,6 +216,176 @@ std::uint64_t RaftNode::CurrentTerm() const {
 std::optional<std::uint32_t> RaftNode::LeaderId() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return leader_id_;
+}
+
+std::uint64_t RaftNode::LastLogIndex() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_.LastLogIndex();
+}
+
+std::uint64_t RaftNode::CommitIndex() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_.CommitIndex();
+}
+
+ProposeResult RaftNode::Propose(
+    std::string command,
+    const std::chrono::milliseconds timeout
+) {
+    if (timeout.count() <= 0) {
+        throw std::invalid_argument(
+            "Raft propose timeout must be positive"
+        );
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    ProposeResult result;
+    result.term = current_term_;
+    result.leader_id = leader_id_;
+
+    if (!started_ || stopping_) {
+        result.status = ProposeStatus::Stopped;
+        return result;
+    }
+
+    if (role_ != RaftRole::Leader) {
+        result.status = ProposeStatus::NotLeader;
+        return result;
+    }
+
+    const std::uint64_t proposal_term = current_term_;
+    const std::uint64_t proposal_index =
+        storage_.LastLogIndex() + 1;
+
+    RaftStorage::Entry entry;
+    entry.set_index(proposal_index);
+    entry.set_term(proposal_term);
+    entry.set_command(std::move(command));
+
+    storage_.AppendEntries({entry});
+
+    result.index = proposal_index;
+    result.term = proposal_term;
+    result.leader_id = config_.replica_id;
+
+    std::fprintf(
+        stderr,
+        "Raft replica %u proposes log index %llu in term %llu\n",
+        config_.replica_id,
+        static_cast<unsigned long long>(proposal_index),
+        static_cast<unsigned long long>(proposal_term)
+    );
+
+    // RF=1 commits immediately. For larger groups this remains false until
+    // follower matchIndex values have advanced.
+    AdvanceCommitIndexLocked();
+    ScheduleImmediateReplicationLocked();
+
+    const auto deadline = Clock::now() + timeout;
+
+    while (true) {
+        if (storage_.CommitIndex() >= proposal_index) {
+            result.status = ProposeStatus::Committed;
+            return result;
+        }
+
+        if (!started_ || stopping_) {
+            result.status = ProposeStatus::Stopped;
+            result.leader_id = leader_id_;
+            return result;
+        }
+
+        if (
+            role_ != RaftRole::Leader ||
+            current_term_ != proposal_term
+        ) {
+            result.status = ProposeStatus::NotLeader;
+            result.leader_id = leader_id_;
+            return result;
+        }
+
+        if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (storage_.CommitIndex() >= proposal_index) {
+                result.status = ProposeStatus::Committed;
+            } else {
+                result.status = ProposeStatus::TimedOut;
+            }
+
+            result.leader_id = leader_id_;
+            return result;
+        }
+    }
+}
+
+std::vector<RaftStorage::Entry> RaftNode::GetCommittedEntries(
+    const std::uint64_t start_index,
+    const std::size_t max_entries
+) const {
+    if (start_index == 0) {
+        throw std::invalid_argument(
+            "Raft committed-entry indices start at 1"
+        );
+    }
+
+    if (max_entries == 0) {
+        return {};
+    }
+
+    std::uint64_t commit_index = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        commit_index = storage_.CommitIndex();
+    }
+
+    if (start_index > commit_index) {
+        return {};
+    }
+
+    const std::uint64_t available =
+        commit_index - start_index + 1;
+
+    const std::size_t count =
+        static_cast<std::size_t>(
+            std::min<std::uint64_t>(
+                available,
+                static_cast<std::uint64_t>(max_entries)
+            )
+        );
+
+    return storage_.GetEntries(start_index, count);
+}
+
+bool RaftNode::WaitForCommitIndexAtLeast(
+    const std::uint64_t index,
+    const std::chrono::milliseconds timeout
+) {
+    if (timeout.count() <= 0) {
+        throw std::invalid_argument(
+            "Raft commit wait timeout must be positive"
+        );
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (storage_.CommitIndex() >= index) {
+        return true;
+    }
+
+    const auto deadline = Clock::now() + timeout;
+
+    while (!stopping_) {
+        if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            break;
+        }
+
+        if (storage_.CommitIndex() >= index) {
+            return true;
+        }
+    }
+
+    return storage_.CommitIndex() >= index;
 }
 
 grpc::Status RaftNode::RequestVote(
@@ -398,6 +570,13 @@ grpc::Status RaftNode::AppendEntries(
                 );
             }
 
+            if (incoming.term() == 0) {
+                return grpc::Status(
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "AppendEntries contains a term-0 real entry"
+                );
+            }
+
             ++expected_index;
         }
 
@@ -446,12 +625,29 @@ grpc::Status RaftNode::AppendEntries(
             }
 
             storage_.AppendEntries(suffix);
+
+            std::fprintf(
+                stderr,
+                "Raft replica %u appended through log index %llu "
+                "from leader %u in term %llu\n",
+                config_.replica_id,
+                static_cast<unsigned long long>(
+                    storage_.LastLogIndex()
+                ),
+                request->leader_id(),
+                static_cast<unsigned long long>(
+                    request->term()
+                )
+            );
         }
 
         if (
             request->leader_commit() >
             storage_.CommitIndex()
         ) {
+            const std::uint64_t old_commit =
+                storage_.CommitIndex();
+
             const std::uint64_t new_commit =
                 std::min(
                     request->leader_commit(),
@@ -459,6 +655,18 @@ grpc::Status RaftNode::AppendEntries(
                 );
 
             storage_.SetCommitIndex(new_commit);
+
+            if (new_commit != old_commit) {
+                std::fprintf(
+                    stderr,
+                    "Raft replica %u advances follower commit "
+                    "from %llu to %llu\n",
+                    config_.replica_id,
+                    static_cast<unsigned long long>(old_commit),
+                    static_cast<unsigned long long>(new_commit)
+                );
+                cv_.notify_all();
+            }
         }
 
         const std::uint64_t match_index =
@@ -516,7 +724,7 @@ void RaftNode::TimerLoop() {
                 config_.heartbeat_interval;
 
             lock.unlock();
-            SendHeartbeats();
+            ReplicateToPeers();
             lock.lock();
             continue;
         }
@@ -567,6 +775,7 @@ void RaftNode::StartElection() {
         leader_id_.reset();
 
         election_term = current_term_ + 1;
+
         storage_.SetCurrentTermAndVote(
             election_term,
             config_.replica_id
@@ -588,10 +797,17 @@ void RaftNode::StartElection() {
 
         std::fprintf(
             stderr,
-            "Raft replica %u starts election for term %llu\n",
+            "Raft replica %u starts election for term %llu "
+            "(last_log=%llu/%llu)\n",
             config_.replica_id,
             static_cast<unsigned long long>(
                 election_term
+            ),
+            static_cast<unsigned long long>(
+                request.last_log_index()
+            ),
+            static_cast<unsigned long long>(
+                request.last_log_term()
             )
         );
     }
@@ -669,9 +885,14 @@ void RaftNode::StartElection() {
     }
 }
 
-void RaftNode::SendHeartbeats() {
-    madkv::raft::AppendEntriesRequest request;
-    std::uint64_t heartbeat_term = 0;
+void RaftNode::ReplicateToPeers() {
+    struct Round {
+        Peer* peer = nullptr;
+        madkv::raft::AppendEntriesRequest request;
+    };
+
+    std::uint64_t leader_term = 0;
+    std::vector<Round> rounds;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -683,27 +904,74 @@ void RaftNode::SendHeartbeats() {
             return;
         }
 
-        heartbeat_term = current_term_;
-
+        leader_term = current_term_;
         const std::uint64_t last_index =
             storage_.LastLogIndex();
 
-        request.set_term(heartbeat_term);
-        request.set_leader_id(config_.replica_id);
-        request.set_prev_log_index(last_index);
-        request.set_prev_log_term(
-            storage_.LastLogTerm()
-        );
-        request.set_leader_commit(
-            storage_.CommitIndex()
-        );
+        rounds.reserve(peers_.size());
+
+        for (Peer& peer : peers_) {
+            if (peer.next_index == 0) {
+                peer.next_index = 1;
+            }
+
+            if (peer.next_index > last_index + 1) {
+                peer.next_index = last_index + 1;
+            }
+
+            Round round;
+            round.peer = &peer;
+
+            auto& request = round.request;
+            request.set_term(leader_term);
+            request.set_leader_id(config_.replica_id);
+
+            const std::uint64_t prev_index =
+                peer.next_index - 1;
+
+            request.set_prev_log_index(prev_index);
+
+            if (prev_index == 0) {
+                request.set_prev_log_term(0);
+            } else {
+                const auto previous =
+                    storage_.GetEntry(prev_index);
+
+                if (!previous.has_value()) {
+                    throw std::runtime_error(
+                        "Leader nextIndex points beyond a log gap"
+                    );
+                }
+
+                request.set_prev_log_term(
+                    previous->term()
+                );
+            }
+
+            const auto entries =
+                storage_.GetEntries(
+                    peer.next_index,
+                    config_.max_entries_per_append
+                );
+
+            for (const auto& entry : entries) {
+                *request.add_entries() = entry;
+            }
+
+            request.set_leader_commit(
+                storage_.CommitIndex()
+            );
+
+            rounds.push_back(std::move(round));
+        }
     }
 
     std::vector<std::future<AppendRpcResult>> futures;
-    futures.reserve(peers_.size());
+    futures.reserve(rounds.size());
 
-    for (Peer& peer : peers_) {
-        Peer* const peer_ptr = &peer;
+    for (Round& round : rounds) {
+        Peer* const peer_ptr = round.peer;
+        const auto request = round.request;
 
         futures.push_back(
             std::async(
@@ -718,8 +986,12 @@ void RaftNode::SendHeartbeats() {
         );
     }
 
-    for (auto& future : futures) {
-        const AppendRpcResult result = future.get();
+    bool schedule_immediate = false;
+
+    for (std::size_t i = 0; i < futures.size(); ++i) {
+        const AppendRpcResult result = futures[i].get();
+        Round& round = rounds[i];
+        Peer& peer = *round.peer;
 
         if (!result.rpc_ok) {
             continue;
@@ -738,13 +1010,75 @@ void RaftNode::SendHeartbeats() {
 
         if (
             role_ != RaftRole::Leader ||
-            current_term_ != heartbeat_term
+            current_term_ != leader_term
         ) {
             return;
         }
 
-        // A false reply means the follower log is behind/conflicting.
-        // Step 3 will use nextIndex/matchIndex to repair it.
+        if (result.reply.success()) {
+            const std::uint64_t acknowledged =
+                round.request.prev_log_index() +
+                static_cast<std::uint64_t>(
+                    round.request.entries_size()
+                );
+
+            peer.match_index =
+                std::max(
+                    peer.match_index,
+                    acknowledged
+                );
+
+            peer.next_index =
+                peer.match_index + 1;
+
+            if (
+                AdvanceCommitIndexLocked()
+            ) {
+                // Followers learn the new leaderCommit in the next round.
+                schedule_immediate = true;
+            }
+
+            if (
+                peer.next_index <=
+                storage_.LastLogIndex()
+            ) {
+                // This follower still has more entries to catch up.
+                schedule_immediate = true;
+            }
+        } else {
+            const std::uint64_t old_next =
+                peer.next_index;
+
+            BacktrackNextIndexLocked(
+                peer,
+                result.reply
+            );
+
+            std::fprintf(
+                stderr,
+                "Raft leader %u backs replica %u nextIndex "
+                "from %llu to %llu\n",
+                config_.replica_id,
+                peer.replica_id,
+                static_cast<unsigned long long>(old_next),
+                static_cast<unsigned long long>(
+                    peer.next_index
+                )
+            );
+
+            schedule_immediate = true;
+        }
+    }
+
+    if (schedule_immediate) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (
+            role_ == RaftRole::Leader &&
+            current_term_ == leader_term
+        ) {
+            ScheduleImmediateReplicationLocked();
+        }
     }
 }
 
@@ -830,19 +1164,35 @@ void RaftNode::BecomeFollowerLocked(
     } else {
         cv_.notify_all();
     }
+
+    // Wake any Propose call that was waiting on leadership/commit.
+    cv_.notify_all();
 }
 
 void RaftNode::BecomeLeaderLocked() {
     role_ = RaftRole::Leader;
     leader_id_ = config_.replica_id;
+
+    const std::uint64_t next_index =
+        storage_.LastLogIndex() + 1;
+
+    for (Peer& peer : peers_) {
+        peer.next_index = next_index;
+        peer.match_index = 0;
+    }
+
     heartbeat_deadline_ = Clock::now();
 
     std::fprintf(
         stderr,
-        "Raft replica %u becomes LEADER for term %llu\n",
+        "Raft replica %u becomes LEADER for term %llu "
+        "(nextIndex initialized to %llu)\n",
         config_.replica_id,
         static_cast<unsigned long long>(
             current_term_
+        ),
+        static_cast<unsigned long long>(
+            next_index
         )
     );
 
@@ -869,6 +1219,15 @@ void RaftNode::ResetElectionDeadlineLocked() {
     cv_.notify_all();
 }
 
+void RaftNode::ScheduleImmediateReplicationLocked() {
+    if (role_ != RaftRole::Leader) {
+        return;
+    }
+
+    heartbeat_deadline_ = Clock::now();
+    cv_.notify_all();
+}
+
 bool RaftNode::CandidateLogIsUpToDateLocked(
     const std::uint64_t candidate_last_index,
     const std::uint64_t candidate_last_term
@@ -883,6 +1242,146 @@ bool RaftNode::CandidateLogIsUpToDateLocked(
     return
         candidate_last_index >=
         storage_.LastLogIndex();
+}
+
+bool RaftNode::AdvanceCommitIndexLocked() {
+    const std::uint64_t old_commit =
+        storage_.CommitIndex();
+
+    const std::uint64_t last_index =
+        storage_.LastLogIndex();
+
+    for (
+        std::uint64_t candidate = last_index;
+        candidate > old_commit;
+        --candidate
+    ) {
+        const auto entry =
+            storage_.GetEntry(candidate);
+
+        if (!entry.has_value()) {
+            throw std::runtime_error(
+                "Raft leader log contains a gap while advancing commit"
+            );
+        }
+
+        // Raft's commitment restriction: a leader counts replicas to
+        // directly commit only entries from its current term. Once such an
+        // entry is committed, all preceding entries become committed too.
+        if (entry->term() != current_term_) {
+            continue;
+        }
+
+        std::size_t replicated = 1;  // The leader itself.
+
+        for (const Peer& peer : peers_) {
+            if (peer.match_index >= candidate) {
+                ++replicated;
+            }
+        }
+
+        if (replicated >= Majority()) {
+            storage_.SetCommitIndex(candidate);
+
+            std::fprintf(
+                stderr,
+                "Raft leader %u commits through log index %llu "
+                "in term %llu with %zu/%zu replicas\n",
+                config_.replica_id,
+                static_cast<unsigned long long>(candidate),
+                static_cast<unsigned long long>(
+                    current_term_
+                ),
+                replicated,
+                peers_.size() + 1
+            );
+
+            cv_.notify_all();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void RaftNode::BacktrackNextIndexLocked(
+    Peer& peer,
+    const madkv::raft::AppendEntriesReply& reply
+) {
+    std::uint64_t next_index = 0;
+
+    if (reply.conflict_term() != 0) {
+        const auto leader_last_for_term =
+            FindLastIndexOfTermLocked(
+                reply.conflict_term()
+            );
+
+        if (leader_last_for_term.has_value()) {
+            next_index =
+                *leader_last_for_term + 1;
+        } else {
+            next_index =
+                reply.conflict_index();
+        }
+    } else if (reply.conflict_index() != 0) {
+        next_index =
+            reply.conflict_index();
+    } else if (peer.next_index > 1) {
+        next_index =
+            peer.next_index - 1;
+    } else {
+        next_index = 1;
+    }
+
+    const std::uint64_t maximum =
+        storage_.LastLogIndex() + 1;
+
+    next_index =
+        std::max<std::uint64_t>(
+            1,
+            std::min(next_index, maximum)
+        );
+
+    // Never back up behind an index this leader has already observed the
+    // follower successfully match.
+    next_index =
+        std::max(
+            next_index,
+            peer.match_index + 1
+        );
+
+    peer.next_index = next_index;
+}
+
+std::optional<std::uint64_t>
+RaftNode::FindLastIndexOfTermLocked(
+    const std::uint64_t term
+) const {
+    if (term == 0) {
+        return std::nullopt;
+    }
+
+    std::uint64_t index =
+        storage_.LastLogIndex();
+
+    while (index > 0) {
+        const auto entry =
+            storage_.GetEntry(index);
+
+        if (!entry.has_value()) {
+            throw std::runtime_error(
+                "Raft leader log contains a gap"
+            );
+        }
+
+        if (entry->term() == term) {
+            return index;
+        }
+
+        --index;
+    }
+
+    return std::nullopt;
 }
 
 std::size_t RaftNode::Majority() const {

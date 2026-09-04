@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,24 @@ enum class RaftRole {
     Leader,
 };
 
+enum class ProposeStatus {
+    Committed,
+    NotLeader,
+    TimedOut,
+    Stopped,
+};
+
+struct ProposeResult {
+    ProposeStatus status = ProposeStatus::Stopped;
+    std::uint64_t index = 0;
+    std::uint64_t term = 0;
+    std::optional<std::uint32_t> leader_id;
+
+    bool committed() const {
+        return status == ProposeStatus::Committed;
+    }
+};
+
 class RaftNode final : public madkv::raft::RaftPeer::Service {
 public:
     struct Config {
@@ -35,6 +54,10 @@ public:
         std::chrono::milliseconds election_timeout_max{1400};
         std::chrono::milliseconds heartbeat_interval{180};
         std::chrono::milliseconds rpc_timeout{300};
+
+        // A single AppendEntries RPC carries at most this many entries.
+        // Lagging followers are caught up by scheduling immediate rounds.
+        std::size_t max_entries_per_append = 128;
     };
 
     RaftNode(Config config, RaftStorage& storage);
@@ -50,6 +73,29 @@ public:
     RaftRole Role() const;
     std::uint64_t CurrentTerm() const;
     std::optional<std::uint32_t> LeaderId() const;
+
+    std::uint64_t LastLogIndex() const;
+    std::uint64_t CommitIndex() const;
+
+    // Append a command to the local leader log and wait until the entry is
+    // committed by a majority. If leadership is lost first, the caller is
+    // told to retry through the current/new leader.
+    ProposeResult Propose(
+        std::string command,
+        std::chrono::milliseconds timeout
+    );
+
+    // Utility for the state-machine layer used in Step 4. Committed entries
+    // never change, so callers can consume them in increasing index order.
+    std::vector<RaftStorage::Entry> GetCommittedEntries(
+        std::uint64_t start_index,
+        std::size_t max_entries
+    ) const;
+
+    bool WaitForCommitIndexAtLeast(
+        std::uint64_t index,
+        std::chrono::milliseconds timeout
+    );
 
     grpc::Status RequestVote(
         grpc::ServerContext* context,
@@ -69,6 +115,11 @@ private:
         std::string address;
         std::shared_ptr<grpc::Channel> channel;
         std::unique_ptr<madkv::raft::RaftPeer::Stub> stub;
+
+        // Leader-only volatile state. These values are reset whenever this
+        // node becomes leader.
+        std::uint64_t next_index = 1;
+        std::uint64_t match_index = 0;
     };
 
     struct VoteRpcResult {
@@ -83,7 +134,7 @@ private:
 
     void TimerLoop();
     void StartElection();
-    void SendHeartbeats();
+    void ReplicateToPeers();
 
     VoteRpcResult SendRequestVote(
         Peer& peer,
@@ -103,10 +154,20 @@ private:
 
     void BecomeLeaderLocked();
     void ResetElectionDeadlineLocked();
+    void ScheduleImmediateReplicationLocked();
 
     bool CandidateLogIsUpToDateLocked(
         std::uint64_t candidate_last_index,
         std::uint64_t candidate_last_term
+    ) const;
+
+    bool AdvanceCommitIndexLocked();
+    void BacktrackNextIndexLocked(
+        Peer& peer,
+        const madkv::raft::AppendEntriesReply& reply
+    );
+    std::optional<std::uint64_t> FindLastIndexOfTermLocked(
+        std::uint64_t term
     ) const;
 
     std::size_t Majority() const;

@@ -82,14 +82,33 @@ std::vector<std::string> ParsePeers(const std::string& input) {
     return peers;
 }
 
+const char* ProposeStatusName(
+    const madkv::raftcore::ProposeStatus status
+) {
+    using madkv::raftcore::ProposeStatus;
+
+    switch (status) {
+        case ProposeStatus::Committed:
+            return "COMMITTED";
+        case ProposeStatus::NotLeader:
+            return "NOT_LEADER";
+        case ProposeStatus::TimedOut:
+            return "TIMED_OUT";
+        case ProposeStatus::Stopped:
+            return "STOPPED";
+    }
+
+    return "UNKNOWN";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 5) {
+    if (argc != 5 && argc != 6) {
         std::fprintf(
             stderr,
             "Usage: %s <replica_id> <p2p_listen> "
-            "<peer_addrs|none> <backer_path>\n",
+            "<peer_addrs|none> <backer_path> [auto_command]\n",
             argv[0]
         );
         return 1;
@@ -118,9 +137,57 @@ int main(int argc, char** argv) {
 
         node.Start();
 
+        const bool auto_propose = argc == 6;
+        const std::string auto_command =
+            auto_propose ? argv[5] : std::string();
+
+        bool proposal_attempted = false;
+
         while (!g_stop.load()) {
+            if (
+                auto_propose &&
+                !proposal_attempted &&
+                node.IsLeader()
+            ) {
+                proposal_attempted = true;
+
+                const auto result =
+                    node.Propose(
+                        auto_command,
+                        std::chrono::seconds(8)
+                    );
+
+                const std::string leader_text =
+                    result.leader_id.has_value()
+                        ? std::to_string(*result.leader_id)
+                        : "unknown";
+
+                std::fprintf(
+                    stderr,
+                    "AUTO_PROPOSE replica=%u status=%s "
+                    "index=%llu term=%llu leader=%s "
+                    "last_log=%llu commit=%llu command='%s'\n",
+                    replica_id,
+                    ProposeStatusName(result.status),
+                    static_cast<unsigned long long>(
+                        result.index
+                    ),
+                    static_cast<unsigned long long>(
+                        result.term
+                    ),
+                    leader_text.c_str(),
+                    static_cast<unsigned long long>(
+                        node.LastLogIndex()
+                    ),
+                    static_cast<unsigned long long>(
+                        node.CommitIndex()
+                    ),
+                    auto_command.c_str()
+                );
+            }
+
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(100)
+                std::chrono::milliseconds(50)
             );
         }
 
