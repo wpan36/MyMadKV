@@ -6,15 +6,30 @@ default:
 
 # install extra dependencies of your KV code
 deps:
-    # FIXME: your dependency installation commands here
+    sudo apt-get update
+    sudo apt-get install -y \
+        build-essential \
+        cmake \
+        pkg-config \
+        protobuf-compiler \
+        protobuf-compiler-grpc \
+        libprotobuf-dev \
+        libgrpc++-dev \
+        librocksdb-dev
 
 # build your executables in release mode
 build:
-    # FIXME: your build commands here (don't include clean)
+    cmake \
+        -S kvstore/partitioned_kvstore \
+        -B kvstore/partitioned_kvstore/build \
+        -DCMAKE_BUILD_TYPE=Release
+    cmake --build \
+        kvstore/partitioned_kvstore/build \
+        -j"$(nproc)"
 
 # clean the build of your executables
 clean:
-    # FIXME: your clean commands here
+    rm -rf kvstore/partitioned_kvstore/build
 
 # run your KV store manager replica
 manager rep_id="0" \
@@ -24,9 +39,14 @@ manager rep_id="0" \
         server_rf="3" \
         servers="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779,127.0.0.1:3780,127.0.0.1:3781,127.0.0.1:3782"\
         backer_path="./backer.m.0":
-    # FIXME: your manager run command here, listening on 0.0.0.0:p2p_port for
-    #        peer replica connections and 0.0.0.0:man_port for both server and
-    #        client registration requests
+    kvstore/partitioned_kvstore/build/bin/kv_manager \
+        "{{rep_id}}" \
+        "0.0.0.0:{{man_port}}" \
+        "0.0.0.0:{{p2p_port}}" \
+        "{{peers}}" \
+        "{{server_rf}}" \
+        "{{servers}}" \
+        "{{backer_path}}"
 
 # run your KV store server replica
 server part_id="0" \
@@ -36,33 +56,35 @@ server part_id="0" \
        p2p_port="3707" \
        peers="127.0.0.1:3708,127.0.0.1:3709" \
        backer_path="./backer.s0.0":
-    # FIXME: your server run command here. The server should first contact the
-    #        replicated managers to get its assignment of key range(s). It then
-    #        listens on 0.0.0.0:p2p_port for peer replica connections and
-    #        0.0.0.0:api_port for new clients, and stores all durable state under
-    #        backer_path
+    kvstore/partitioned_kvstore/build/bin/kv_server \
+        "{{part_id}}" \
+        "{{rep_id}}" \
+        "{{managers}}" \
+        "0.0.0.0:{{api_port}}" \
+        "0.0.0.0:{{p2p_port}}" \
+        "{{peers}}" \
+        "{{backer_path}}"
 
 # run you KV store client in stdin/out interface mode
 client managers="127.0.0.1:3666,127.0.0.1:3667,127.0.0.1:3668":
-    # FIXME: your client run command here, querying the replicated managers
-    #        for server registration information, and then connects to the
-    #        servers ready to perform operations
+    kvstore/partitioned_kvstore/build/bin/kv_client \
+        "{{managers}}"
 
 # kill all processes of your KV store system
 kill:
-    # FIXME: your kill commands here
-    #        make sure that it kills all server, clients, and any extra helper
-    #        processes of your system; redirecting both out & err to /dev/null
-    #        is recommended
-    #   TIP: commands such as 'pkill' may return non-zero exit code on success,
-    #        which would by default abort the 'just' recipe early; prepend the
-    #        command with a '-' sign to ignore its exit code
+    -pkill -x kv_client > /dev/null 2>&1
+    -pkill -x kv_server > /dev/null 2>&1
+    -pkill -x kv_manager > /dev/null 2>&1
+    -pkill -x raft_election_demo > /dev/null 2>&1
+    -pkill -x raft_kv_demo_server > /dev/null 2>&1
+    -pkill -x kv_direct_client_demo > /dev/null 2>&1
 
 # NOTE: feel free to add more recipes as you see fit...
 #       also feel free to add extra parameters to the recipes as you see fit,
 #       but don't change the existing parameters
 
 python_run := if `which uv || true` != "" { "uv run" } else { "python3" }
+
 tmpdir_prefix := "/tmp/madkv-p3"
 
 # launch the KV service components on node (see README for conventions)

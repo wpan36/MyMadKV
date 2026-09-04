@@ -1,336 +1,126 @@
-#include <cstdio>
 #include <cstdint>
-#include <cstdlib>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
 
-#include "cluster_client.h"
 #include "cluster.pb.h"
-#include "durable_command_log.h"
+#include "cluster_client.h"
 #include "in_memory_kvstore.h"
-#include "in_memory_kvstore.grpc.pb.h"
-#include "in_memory_kvstore.pb.h"
-#include "partitioning.h"
+#include "raft_node.h"
+#include "raft_storage.h"
+#include "replicated_kv_service.h"
 
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerContext;
-using grpc::Status;
-using grpc::StatusCode;
-
-namespace kv = kvstore_service;
-namespace storage = madkv::storage;
 namespace cluster = madkv::cluster;
-namespace partitioning = madkv::partitioning;
 
 namespace {
 
-using Command = DurableCommandLog::Command;
-
-class WrongPartitionError final
-    : public std::runtime_error {
-public:
-    explicit WrongPartitionError(
-        const std::string& message
-    )
-        : std::runtime_error(message) {
-    }
-};
-
-// Test-only deterministic crash injection.
-//
-// When both environment variables are set, the server exits immediately
-// after synchronously appending the matching command, but before applying
-// it to the in-memory state machine or replying to the client.
-struct CrashAfterAppendFailpoint {
-    bool enabled = false;
-    std::string client_id;
-    std::uint64_t request_id = 0;
-};
-
-CrashAfterAppendFailpoint
-LoadCrashAfterAppendFailpoint() {
-    const char* client_id =
-        std::getenv(
-            "MADKV_FAILPOINT_CRASH_CLIENT_ID"
-        );
-
-    const char* request_id =
-        std::getenv(
-            "MADKV_FAILPOINT_CRASH_REQUEST_ID"
-        );
-
-    const bool has_client_id =
-        client_id != nullptr &&
-        client_id[0] != '\0';
-
-    const bool has_request_id =
-        request_id != nullptr &&
-        request_id[0] != '\0';
-
-    if (has_client_id != has_request_id) {
-        throw std::invalid_argument(
-            "both MADKV_FAILPOINT_CRASH_CLIENT_ID "
-            "and MADKV_FAILPOINT_CRASH_REQUEST_ID "
-            "must be set together"
-        );
-    }
-
-    if (!has_client_id) {
-        return CrashAfterAppendFailpoint{};
-    }
-
-    std::size_t consumed = 0;
-    std::uint64_t parsed_request_id = 0;
-
-    try {
-        parsed_request_id = std::stoull(
-            request_id,
-            &consumed,
-            10
-        );
-    } catch (const std::exception&) {
-        throw std::invalid_argument(
-            "MADKV_FAILPOINT_CRASH_REQUEST_ID "
-            "must be a positive integer"
-        );
-    }
-
-    if (
-        consumed != std::string(request_id).size() ||
-        parsed_request_id == 0
-    ) {
-        throw std::invalid_argument(
-            "MADKV_FAILPOINT_CRASH_REQUEST_ID "
-            "must be a positive integer"
-        );
-    }
-
-    CrashAfterAppendFailpoint failpoint;
-    failpoint.enabled = true;
-    failpoint.client_id = client_id;
-    failpoint.request_id = parsed_request_id;
-
-    return failpoint;
-}
-
-void MaybeCrashAfterAppend(
-    const CrashAfterAppendFailpoint& failpoint,
-    const Command& command
-) {
-    if (
-        !failpoint.enabled ||
-        command.client_id() != failpoint.client_id ||
-        command.request_id() != failpoint.request_id
-    ) {
-        return;
-    }
-
-    std::fprintf(
-        stderr,
-        "FAILPOINT: crashing after durable append "
-        "for client_id=%s request_id=%llu "
-        "sequence=%llu\n",
-        command.client_id().c_str(),
-        static_cast<unsigned long long>(
-            command.request_id()
-        ),
-        static_cast<unsigned long long>(
-            command.sequence()
-        )
-    );
-
-    std::fflush(stderr);
-
-    // _Exit avoids normal stack unwinding and destructors, making this
-    // much closer to an abrupt process crash than throwing an exception.
-    std::_Exit(86);
-}
-
-struct MutationReply {
-    bool found = false;
-    std::string value;
-};
-
-bool SameReply(
-    const MutationReply& left,
-    const MutationReply& right
-) {
-    return
-        left.found == right.found &&
-        left.value == right.value;
-}
-
-MutationReply ReplyFromCommand(
-    const Command& command
-) {
-    return MutationReply{
-        command.reply_found(),
-        command.reply_value()
-    };
-}
-
-std::string RequestKey(
-    const std::string& client_id,
-    const std::uint64_t request_id
-) {
-    return client_id + ":" +
-        std::to_string(request_id);
-}
-
-struct DedupRecord {
-    storage::MutationType type =
-        storage::MUTATION_TYPE_UNSPECIFIED;
-
-    std::string key;
-    std::string value;
-    MutationReply reply;
-    std::uint64_t sequence = 0;
-};
-
-class DedupTable final {
-public:
-    std::optional<MutationReply> Lookup(
-        const Command& command
-    ) const {
-        const auto iterator = records_.find(
-            RequestKey(
-                command.client_id(),
-                command.request_id()
-            )
-        );
-
-        if (iterator == records_.end()) {
-            return std::nullopt;
-        }
-
-        const DedupRecord& record =
-            iterator->second;
-
-        if (
-            record.type != command.type() ||
-            record.key != command.key() ||
-            record.value != command.value()
-        ) {
-            throw std::invalid_argument(
-                "client_id/request_id was reused "
-                "for a different mutation"
-            );
-        }
-
-        return record.reply;
-    }
-
-    void Remember(
-        const Command& command
-    ) {
-        if (command.client_id().empty()) {
-            return;
-        }
-
-        const std::string identity =
-            RequestKey(
-                command.client_id(),
-                command.request_id()
-            );
-
-        DedupRecord record;
-        record.type = command.type();
-        record.key = command.key();
-        record.value = command.value();
-        record.reply = ReplyFromCommand(command);
-        record.sequence = command.sequence();
-
-        const auto [iterator, inserted] =
-            records_.emplace(identity, record);
-
-        if (!inserted) {
-            const DedupRecord& existing =
-                iterator->second;
-
-            if (
-                existing.type != record.type ||
-                existing.key != record.key ||
-                existing.value != record.value ||
-                !SameReply(
-                    existing.reply,
-                    record.reply
-                )
-            ) {
-                throw std::runtime_error(
-                    "durable log contains conflicting "
-                    "records for one request identity"
-                );
-            }
-        }
-    }
-
-private:
-    std::unordered_map<
-        std::string,
-        DedupRecord
-    > records_;
-};
-
-std::uint32_t ParseServerId(
-    const std::string& input
+std::uint32_t ParseUint32(
+    const std::string& input,
+    const char* name
 ) {
     std::size_t consumed = 0;
-
     unsigned long parsed = 0;
 
     try {
-        parsed = std::stoul(
-            input,
-            &consumed,
-            10
-        );
+        parsed = std::stoul(input, &consumed, 10);
     } catch (const std::exception&) {
         throw std::invalid_argument(
-            "server_id must be a non-negative integer"
-        );
-    }
-
-    if (consumed != input.size()) {
-        throw std::invalid_argument(
-            "server_id contains invalid characters"
+            std::string(name) +
+            " must be a non-negative integer"
         );
     }
 
     if (
+        consumed != input.size() ||
         parsed >
-        std::numeric_limits<std::uint32_t>::max()
+            std::numeric_limits<std::uint32_t>::max()
     ) {
         throw std::invalid_argument(
-            "server_id is too large"
+            std::string("invalid ") + name
         );
     }
 
     return static_cast<std::uint32_t>(parsed);
 }
 
-struct ClusterAssignment {
-    std::uint32_t server_count = 0;
+std::vector<std::string> ParsePeers(
+    const std::string& input
+) {
+    if (input == "none") {
+        return {};
+    }
+
+    if (input.empty()) {
+        throw std::invalid_argument(
+            "peer address list must be 'none' or non-empty"
+        );
+    }
+
+    std::vector<std::string> peers;
+    std::size_t begin = 0;
+
+    while (begin <= input.size()) {
+        const std::size_t comma =
+            input.find(',', begin);
+
+        const std::size_t end =
+            comma == std::string::npos
+                ? input.size()
+                : comma;
+
+        const std::string peer =
+            input.substr(begin, end - begin);
+
+        if (peer.empty()) {
+            throw std::invalid_argument(
+                "peer address list contains an empty address"
+            );
+        }
+
+        peers.push_back(peer);
+
+        if (comma == std::string::npos) {
+            break;
+        }
+
+        begin = comma + 1;
+    }
+
+    return peers;
+}
+
+struct Assignment {
+    std::uint32_t partition_count = 0;
+    std::uint32_t server_rf = 0;
     std::string public_address;
 };
 
-ClusterAssignment ValidateClusterConfig(
+Assignment ValidateConfig(
     const cluster::ClusterConfig& config,
-    const std::uint32_t server_id
+    const std::uint32_t partition_id,
+    const std::uint32_t replica_id,
+    const std::size_t peer_count
 ) {
-    if (config.server_count() == 0) {
+    if (config.partition_count() == 0) {
         throw std::runtime_error(
-            "manager returned server_count=0"
+            "manager returned partition_count=0"
+        );
+    }
+
+    if (
+        config.server_rf() == 0 ||
+        config.server_rf() > 9 ||
+        (config.server_rf() % 2) == 0
+    ) {
+        throw std::runtime_error(
+            "manager returned invalid server_rf"
         );
     }
 
@@ -339,722 +129,253 @@ ClusterAssignment ValidateClusterConfig(
         cluster::PARTITIONING_SCHEME_FNV1A_64_MOD_N
     ) {
         throw std::runtime_error(
-            "manager returned an unsupported "
-            "partitioning scheme"
+            "manager returned unsupported partitioning scheme"
         );
     }
 
     if (
-        config.servers_size() !=
-        static_cast<int>(config.server_count())
+        partition_id >= config.partition_count() ||
+        replica_id >= config.server_rf()
     ) {
         throw std::runtime_error(
-            "manager configuration has an inconsistent "
-            "server list size"
+            "this partition_id/replica_id is outside topology"
         );
     }
 
-    if (server_id >= config.server_count()) {
+    if (peer_count + 1 != config.server_rf()) {
         throw std::runtime_error(
-            "this server_id is outside the configured "
-            "cluster range"
+            "peer_addrs count does not match manager server_rf"
         );
     }
 
-    std::vector<bool> seen(
-        config.server_count(),
-        false
-    );
+    const std::size_t expected =
+        static_cast<std::size_t>(
+            config.partition_count()
+        ) *
+        config.server_rf();
 
-    bool found_this_server = false;
-    std::string configured_public_address;
+    if (
+        config.replicas_size() !=
+        static_cast<int>(expected)
+    ) {
+        throw std::runtime_error(
+            "manager replica list size is inconsistent"
+        );
+    }
 
-    for (const cluster::ServerInfo& server :
-         config.servers()) {
+    std::vector<bool> seen(expected, false);
+    std::string public_address;
+
+    for (const cluster::ReplicaInfo& info :
+         config.replicas()) {
         if (
-            server.server_id() >=
-            config.server_count()
+            info.partition_id() >=
+                config.partition_count() ||
+            info.replica_id() >=
+                config.server_rf()
         ) {
             throw std::runtime_error(
-                "manager returned an out-of-range server_id"
+                "manager returned out-of-range replica coordinates"
             );
         }
 
-        if (seen[server.server_id()]) {
+        const std::size_t flat_index =
+            static_cast<std::size_t>(
+                info.partition_id()
+            ) *
+            config.server_rf() +
+            info.replica_id();
+
+        if (seen[flat_index]) {
             throw std::runtime_error(
-                "manager returned a duplicate server_id"
+                "manager returned duplicate replica coordinates"
             );
         }
 
-        seen[server.server_id()] = true;
+        seen[flat_index] = true;
 
-        if (server.address().empty()) {
+        if (info.address().empty()) {
             throw std::runtime_error(
                 "manager returned an empty server address"
             );
         }
 
-        if (server.server_id() == server_id) {
-            found_this_server = true;
-            configured_public_address =
-                server.address();
+        if (
+            info.partition_id() == partition_id &&
+            info.replica_id() == replica_id
+        ) {
+            public_address = info.address();
         }
     }
 
-    if (!found_this_server) {
+    for (const bool present : seen) {
+        if (!present) {
+            throw std::runtime_error(
+                "manager configuration is missing a replica"
+            );
+        }
+    }
+
+    if (public_address.empty()) {
         throw std::runtime_error(
-            "manager configuration does not contain "
-            "this server"
+            "manager configuration does not contain this replica"
         );
     }
 
-    return ClusterAssignment{
-        config.server_count(),
-        configured_public_address
+    return Assignment{
+        config.partition_count(),
+        config.server_rf(),
+        public_address
     };
-}
-
-void ValidateRequestHeader(
-    const kv::RequestHeader& header
-) {
-    if (header.client_id().empty()) {
-        throw std::invalid_argument(
-            "mutation request has an empty client_id"
-        );
-    }
-
-    if (header.request_id() == 0) {
-        throw std::invalid_argument(
-            "mutation request_id must be greater than zero"
-        );
-    }
-}
-
-Command MakeCommand(
-    const storage::MutationType type,
-    const std::string& key,
-    const std::string& value,
-    const kv::RequestHeader& header
-) {
-    ValidateRequestHeader(header);
-
-    Command command;
-    command.set_type(type);
-    command.set_key(key);
-    command.set_value(value);
-    command.set_client_id(
-        header.client_id()
-    );
-    command.set_request_id(
-        header.request_id()
-    );
-
-    return command;
-}
-
-MutationReply PreviewMutation(
-    InMemoryKVStore& store,
-    const Command& command
-) {
-    switch (command.type()) {
-        case storage::MUTATION_TYPE_PUT:
-        case storage::MUTATION_TYPE_DELETE:
-            return MutationReply{
-                store.Get(
-                    command.key()
-                ).has_value(),
-                ""
-            };
-
-        case storage::MUTATION_TYPE_SWAP: {
-            const auto old_value =
-                store.Get(command.key());
-
-            if (!old_value.has_value()) {
-                return MutationReply{false, ""};
-            }
-
-            return MutationReply{
-                true,
-                *old_value
-            };
-        }
-
-        case storage::MUTATION_TYPE_UNSPECIFIED:
-            throw std::invalid_argument(
-                "mutation type is unspecified"
-            );
-
-        default:
-            throw std::invalid_argument(
-                "mutation type is unknown"
-            );
-    }
-}
-
-MutationReply ApplyMutation(
-    InMemoryKVStore& store,
-    const Command& command
-) {
-    switch (command.type()) {
-        case storage::MUTATION_TYPE_PUT:
-            return MutationReply{
-                store.Put(
-                    command.key(),
-                    command.value()
-                ),
-                ""
-            };
-
-        case storage::MUTATION_TYPE_SWAP: {
-            const auto old_value =
-                store.Swap(
-                    command.key(),
-                    command.value()
-                );
-
-            if (!old_value.has_value()) {
-                return MutationReply{false, ""};
-            }
-
-            return MutationReply{
-                true,
-                *old_value
-            };
-        }
-
-        case storage::MUTATION_TYPE_DELETE:
-            return MutationReply{
-                store.Delete(command.key()),
-                ""
-            };
-
-        case storage::MUTATION_TYPE_UNSPECIFIED:
-            throw std::runtime_error(
-                "cannot apply an unspecified mutation"
-            );
-
-        default:
-            throw std::runtime_error(
-                "cannot apply an unknown mutation"
-            );
-    }
-}
-
-void StoreReplyInCommand(
-    Command& command,
-    const MutationReply& reply
-) {
-    command.set_reply_found(reply.found);
-    command.set_reply_value(reply.value);
-}
-
-Status ErrorStatus(
-    const std::exception& error
-) {
-    if (
-        dynamic_cast<const WrongPartitionError*>(
-            &error
-        ) != nullptr
-    ) {
-        return Status(
-            StatusCode::FAILED_PRECONDITION,
-            error.what()
-        );
-    }
-
-    if (
-        dynamic_cast<const std::invalid_argument*>(
-            &error
-        ) != nullptr
-    ) {
-        return Status(
-            StatusCode::INVALID_ARGUMENT,
-            error.what()
-        );
-    }
-
-    return Status(
-        StatusCode::INTERNAL,
-        error.what()
-    );
 }
 
 }  // namespace
 
-class ServiceImpl final : public kv::Operation::Service {
-public:
-    ServiceImpl(
-        InMemoryKVStore& store,
-        DurableCommandLog& command_log,
-        DedupTable& dedup_table,
-        const std::uint32_t server_id,
-        const std::uint32_t server_count,
-        const CrashAfterAppendFailpoint& crash_failpoint
-    )
-        : store_(store),
-          command_log_(command_log),
-          dedup_table_(dedup_table),
-          server_id_(server_id),
-          server_count_(server_count),
-          crash_failpoint_(crash_failpoint) {
-    }
-
-    Status Put(
-        ServerContext* /*context*/,
-        const kv::PutRequest* request,
-        kv::PutReply* reply
-    ) override {
-        try {
-            Command command = MakeCommand(
-                storage::MUTATION_TYPE_PUT,
-                request->key(),
-                request->new_value(),
-                request->header()
-            );
-
-            const MutationReply result =
-                ExecuteMutation(
-                    std::move(command)
-                );
-
-            reply->set_found(result.found);
-            return Status::OK;
-        } catch (const std::exception& error) {
-            return ErrorStatus(error);
-        }
-    }
-
-    Status Swap(
-        ServerContext* /*context*/,
-        const kv::SwapRequest* request,
-        kv::SwapReply* reply
-    ) override {
-        try {
-            Command command = MakeCommand(
-                storage::MUTATION_TYPE_SWAP,
-                request->key(),
-                request->new_value(),
-                request->header()
-            );
-
-            const MutationReply result =
-                ExecuteMutation(
-                    std::move(command)
-                );
-
-            reply->set_found(result.found);
-
-            if (result.found) {
-                reply->set_old_value(
-                    result.value
-                );
-            } else {
-                reply->clear_old_value();
-            }
-
-            return Status::OK;
-        } catch (const std::exception& error) {
-            return ErrorStatus(error);
-        }
-    }
-
-    Status Get(
-        ServerContext* /*context*/,
-        const kv::GetRequest* request,
-        kv::GetReply* reply
-    ) override {
-        try {
-            EnsureOwnsKey(request->key());
-
-            std::lock_guard<std::mutex> lock(
-                mutex_
-            );
-
-            const auto value =
-                store_.Get(request->key());
-
-            reply->set_found(
-                value.has_value()
-            );
-
-            if (value.has_value()) {
-                reply->set_value(*value);
-            } else {
-                reply->clear_value();
-            }
-
-            return Status::OK;
-        } catch (const std::exception& error) {
-            return ErrorStatus(error);
-        }
-    }
-
-    Status Scan(
-        ServerContext* /*context*/,
-        const kv::ScanRequest* request,
-        kv::ScanReply* reply
-    ) override {
-        try {
-            std::lock_guard<std::mutex> lock(
-                mutex_
-            );
-
-            reply->clear_list();
-
-            const auto list = store_.Scan(
-                request->start_key(),
-                request->end_key()
-            );
-
-            for (const auto& pair : list) {
-                auto* output =
-                    reply->add_list();
-
-                output->set_key(pair.first);
-                output->set_value(pair.second);
-            }
-
-            return Status::OK;
-        } catch (const std::exception& error) {
-            return ErrorStatus(error);
-        }
-    }
-
-    Status Delete(
-        ServerContext* /*context*/,
-        const kv::DeleteRequest* request,
-        kv::DeleteReply* reply
-    ) override {
-        try {
-            Command command = MakeCommand(
-                storage::MUTATION_TYPE_DELETE,
-                request->key(),
-                "",
-                request->header()
-            );
-
-            const MutationReply result =
-                ExecuteMutation(
-                    std::move(command)
-                );
-
-            reply->set_found(result.found);
-            return Status::OK;
-        } catch (const std::exception& error) {
-            return ErrorStatus(error);
-        }
-    }
-
-private:
-    void EnsureOwnsKey(
-        const std::string& key
-    ) const {
-        const std::uint32_t owner =
-            partitioning::OwnerForKey(
-                key,
-                server_count_
-            );
-
-        if (owner != server_id_) {
-            throw WrongPartitionError(
-                "key belongs to server " +
-                std::to_string(owner) +
-                ", but request was sent to server " +
-                std::to_string(server_id_)
-            );
-        }
-    }
-
-    MutationReply ExecuteMutation(
-        Command command
-    ) {
-        std::lock_guard<std::mutex> lock(
-            mutex_
-        );
-
-        EnsureOwnsKey(command.key());
-
-        const auto cached =
-            dedup_table_.Lookup(command);
-
-        if (cached.has_value()) {
-            return *cached;
-        }
-
-        const MutationReply predicted =
-            PreviewMutation(store_, command);
-
-        StoreReplyInCommand(
-            command,
-            predicted
-        );
-
-        command.set_sequence(
-            command_log_.Append(command)
-        );
-
-        // At this point the command and its original reply are durable,
-        // but the in-memory state has not yet been changed.
-        MaybeCrashAfterAppend(
-            crash_failpoint_,
-            command
-        );
-
-        const MutationReply actual =
-            ApplyMutation(store_, command);
-
-        if (!SameReply(predicted, actual)) {
-            throw std::runtime_error(
-                "state-machine result differed from "
-                "the reply stored in the durable log"
-            );
-        }
-
-        dedup_table_.Remember(command);
-        return actual;
-    }
-
-    InMemoryKVStore& store_;
-    DurableCommandLog& command_log_;
-    DedupTable& dedup_table_;
-
-    const std::uint32_t server_id_;
-    const std::uint32_t server_count_;
-    const CrashAfterAppendFailpoint crash_failpoint_;
-
-    std::mutex mutex_;
-};
-
 int main(int argc, char** argv) {
-    if (argc != 5) {
+    if (argc != 8) {
         std::fprintf(
             stderr,
-            "Usage: %s <manager_addr> <server_id> "
-            "<listen_addr> <backer_path>\n",
+            "Usage: %s <partition_id> <replica_id> "
+            "<manager_addrs> <api_listen> <p2p_listen> "
+            "<peer_addrs|none> <backer_path>\n",
             argv[0]
         );
-
         return 1;
     }
 
-    const std::string manager_address = argv[1];
-    const std::uint32_t server_id =
-        ParseServerId(argv[2]);
-
-    const std::string listen_address = argv[3];
-    const std::string backer_path = argv[4];
-
     try {
-        const CrashAfterAppendFailpoint crash_failpoint =
-            LoadCrashAfterAppendFailpoint();
+        const std::uint32_t partition_id =
+            ParseUint32(argv[1], "partition_id");
 
-        if (crash_failpoint.enabled) {
-            std::fprintf(
-                stderr,
-                "Crash-after-append failpoint enabled for "
-                "client_id=%s request_id=%llu\n",
-                crash_failpoint.client_id.c_str(),
-                static_cast<unsigned long long>(
-                    crash_failpoint.request_id
-                )
-            );
-        }
+        const std::uint32_t replica_id =
+            ParseUint32(argv[2], "replica_id");
 
-        ClusterClient cluster_client(
-            manager_address
-        );
+        const std::string manager_addresses = argv[3];
+        const std::string api_listen = argv[4];
+        const std::string p2p_listen = argv[5];
 
-        // Fetch the static configuration before replaying the log.
-        // This lets recovery verify that every durable key belongs
-        // to this server under the current cluster size.
+        const std::vector<std::string> peers =
+            ParsePeers(argv[6]);
+
+        const std::string backer_path = argv[7];
+
+        ClusterClient cluster_client(manager_addresses);
+
         const cluster::ClusterConfig initial_config =
             cluster_client.GetClusterUntilAvailable();
 
-        const ClusterAssignment initial_assignment =
-            ValidateClusterConfig(
+        const Assignment assignment =
+            ValidateConfig(
                 initial_config,
-                server_id
+                partition_id,
+                replica_id,
+                peers.size()
             );
 
-        const std::uint32_t server_count =
-            initial_assignment.server_count;
+        madkv::raftcore::RaftStorage raft_storage(
+            backer_path + "/raft"
+        );
 
-        const std::string public_address =
-            initial_assignment.public_address;
+        madkv::raftcore::RaftNode::Config raft_config;
+        raft_config.replica_id = replica_id;
+        raft_config.listen_address = p2p_listen;
+        raft_config.peer_addresses = peers;
+
+        madkv::raftcore::RaftNode raft(
+            std::move(raft_config),
+            raft_storage
+        );
 
         InMemoryKVStore store;
-        DurableCommandLog command_log(
-            backer_path
-        );
-        DedupTable dedup_table;
 
-        command_log.Replay(
-            [
-                &store,
-                &dedup_table,
-                server_id,
-                server_count
-            ](
-                const Command& command
-            ) {
-                const std::uint32_t owner =
-                    partitioning::OwnerForKey(
-                        command.key(),
-                        server_count
-                    );
-
-                if (owner != server_id) {
-                    throw std::runtime_error(
-                        "durable log contains key '" +
-                        command.key() +
-                        "' owned by server " +
-                        std::to_string(owner) +
-                        ", not this server"
-                    );
-                }
-
-                const auto cached =
-                    command.client_id().empty()
-                        ? std::optional<MutationReply>{}
-                        : dedup_table.Lookup(command);
-
-                if (cached.has_value()) {
-                    if (
-                        !SameReply(
-                            *cached,
-                            ReplyFromCommand(command)
-                        )
-                    ) {
-                        throw std::runtime_error(
-                            "duplicate durable request has "
-                            "a conflicting stored reply"
-                        );
-                    }
-
-                    return;
-                }
-
-                const MutationReply actual =
-                    ApplyMutation(store, command);
-
-                if (!command.client_id().empty()) {
-                    if (
-                        !SameReply(
-                            actual,
-                            ReplyFromCommand(command)
-                        )
-                    ) {
-                        throw std::runtime_error(
-                            "replayed command produced a reply "
-                            "different from its durable reply"
-                        );
-                    }
-
-                    dedup_table.Remember(command);
-                }
-            }
-        );
-
-        std::fprintf(
-            stderr,
-            "Server %u recovered durable log through "
-            "sequence %llu\n",
-            server_id,
-            static_cast<unsigned long long>(
-                command_log.LastSequence()
-            )
-        );
-
-        ServiceImpl service(
+        madkv::kvraft::ReplicatedKVService kv_service(
             store,
-            command_log,
-            dedup_table,
-            server_id,
-            server_count,
-            crash_failpoint
+            raft,
+            partition_id,
+            assignment.partition_count
         );
 
-        ServerBuilder builder;
+        kv_service.RecoverCommittedState();
+        raft.Start();
 
+        grpc::ServerBuilder builder;
         builder.AddListeningPort(
-            listen_address,
+            api_listen,
             grpc::InsecureServerCredentials()
         );
+        builder.RegisterService(&kv_service);
 
-        builder.RegisterService(&service);
-
-        std::unique_ptr<Server> server(
+        std::unique_ptr<grpc::Server> api_server(
             builder.BuildAndStart()
         );
 
-        if (!server) {
-            std::fprintf(
-                stderr,
-                "Failed to start server %u on %s\n",
-                server_id,
-                listen_address.c_str()
+        if (!api_server) {
+            raft.Stop();
+            throw std::runtime_error(
+                "failed to start KV API server on " +
+                api_listen
             );
-
-            return 2;
         }
 
-        // Register only after the listening socket exists.
-        // When the manager reports the cluster ready, every
-        // registered server is already accepting connections.
-        const cluster::ClusterConfig registered_config =
+        const cluster::ClusterConfig registered =
             cluster_client.RegisterServerUntilSuccess(
-                server_id,
-                public_address
+                partition_id,
+                replica_id,
+                assignment.public_address
             );
 
-        const ClusterAssignment registered_assignment =
-            ValidateClusterConfig(
-                registered_config,
-                server_id
+        const Assignment registered_assignment =
+            ValidateConfig(
+                registered,
+                partition_id,
+                replica_id,
+                peers.size()
             );
 
         if (
-            registered_assignment.server_count !=
-                server_count ||
+            registered_assignment.partition_count !=
+                assignment.partition_count ||
+            registered_assignment.server_rf !=
+                assignment.server_rf ||
             registered_assignment.public_address !=
-                public_address
+                assignment.public_address
         ) {
-            server->Shutdown();
+            api_server->Shutdown();
+            raft.Stop();
 
             throw std::runtime_error(
-                "cluster assignment changed during startup"
+                "cluster topology changed during server startup"
             );
         }
 
         std::fprintf(
             stderr,
-            "Server %u running on %s\n"
-            "Public address: %s\n"
-            "Partition rule: FNV1a64(key) %% %u = %u\n"
-            "Durable command log: %s\n"
-            "Cluster ready: %s\n",
-            server_id,
-            listen_address.c_str(),
-            public_address.c_str(),
-            server_count,
-            server_id,
-            backer_path.c_str(),
-            registered_config.ready()
-                ? "true"
-                : "false"
+            "KV replica running: partition=%u/%u "
+            "replica=%u/%u api=%s public=%s p2p=%s "
+            "last_applied=%llu cluster_ready=%s\n",
+            partition_id,
+            assignment.partition_count,
+            replica_id,
+            assignment.server_rf,
+            api_listen.c_str(),
+            assignment.public_address.c_str(),
+            p2p_listen.c_str(),
+            static_cast<unsigned long long>(
+                kv_service.LastApplied()
+            ),
+            registered.ready() ? "true" : "false"
         );
 
-        server->Wait();
+        api_server->Wait();
+        raft.Stop();
+
+        return 0;
     } catch (const std::exception& error) {
         std::fprintf(
             stderr,
             "Server failed: %s\n",
             error.what()
         );
-
-        return 3;
+        return 2;
     }
-
-    return 0;
 }

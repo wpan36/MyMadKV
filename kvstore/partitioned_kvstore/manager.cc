@@ -1,5 +1,7 @@
+#include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -13,17 +15,40 @@
 #include "cluster.grpc.pb.h"
 #include "cluster.pb.h"
 
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerContext;
-using grpc::Status;
-using grpc::StatusCode;
-
 namespace cluster = madkv::cluster;
 
 namespace {
 
-std::vector<std::string> ParseServerAddresses(
+std::uint32_t ParseUint32(
+    const std::string& input,
+    const char* name
+) {
+    std::size_t consumed = 0;
+    unsigned long parsed = 0;
+
+    try {
+        parsed = std::stoul(input, &consumed, 10);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(
+            std::string(name) +
+            " must be a non-negative integer"
+        );
+    }
+
+    if (
+        consumed != input.size() ||
+        parsed >
+            std::numeric_limits<std::uint32_t>::max()
+    ) {
+        throw std::invalid_argument(
+            std::string("invalid ") + name
+        );
+    }
+
+    return static_cast<std::uint32_t>(parsed);
+}
+
+std::vector<std::string> ParseAddresses(
     const std::string& input
 ) {
     if (input.empty()) {
@@ -33,12 +58,12 @@ std::vector<std::string> ParseServerAddresses(
     }
 
     std::vector<std::string> addresses;
-    std::unordered_set<std::string> unique_addresses;
-
+    std::unordered_set<std::string> seen;
     std::size_t begin = 0;
 
     while (begin <= input.size()) {
-        const std::size_t comma = input.find(',', begin);
+        const std::size_t comma =
+            input.find(',', begin);
 
         const std::size_t end =
             comma == std::string::npos
@@ -54,7 +79,7 @@ std::vector<std::string> ParseServerAddresses(
             );
         }
 
-        if (!unique_addresses.insert(address).second) {
+        if (!seen.insert(address).second) {
             throw std::invalid_argument(
                 "duplicate server address: " + address
             );
@@ -69,31 +94,52 @@ std::vector<std::string> ParseServerAddresses(
         begin = comma + 1;
     }
 
-    if (addresses.size() > 50) {
-        throw std::invalid_argument(
-            "server count must not exceed 50"
-        );
-    }
-
     return addresses;
 }
 
-struct ServerRecord {
+struct ReplicaRecord {
     std::string address;
     bool registered = false;
 };
 
-class ClusterManagerServiceImpl final
+class ClusterManagerService final
     : public cluster::ClusterManager::Service {
 public:
-    explicit ClusterManagerServiceImpl(
+    ClusterManagerService(
+        const std::uint32_t server_rf,
         std::vector<std::string> addresses
-    ) {
-        servers_.reserve(addresses.size());
+    )
+        : server_rf_(server_rf) {
+        if (
+            server_rf_ == 0 ||
+            server_rf_ > 9 ||
+            (server_rf_ % 2) == 0
+        ) {
+            throw std::invalid_argument(
+                "server_rf must be an odd number from 1 to 9"
+            );
+        }
+
+        if (
+            addresses.empty() ||
+            addresses.size() % server_rf_ != 0
+        ) {
+            throw std::invalid_argument(
+                "server address count must be a positive "
+                "multiple of server_rf"
+            );
+        }
+
+        partition_count_ =
+            static_cast<std::uint32_t>(
+                addresses.size() / server_rf_
+            );
+
+        replicas_.reserve(addresses.size());
 
         for (std::string& address : addresses) {
-            servers_.push_back(
-                ServerRecord{
+            replicas_.push_back(
+                ReplicaRecord{
                     std::move(address),
                     false
                 }
@@ -101,70 +147,77 @@ public:
         }
     }
 
-    Status RegisterServer(
-        ServerContext* /*context*/,
+    grpc::Status RegisterServer(
+        grpc::ServerContext* /*context*/,
         const cluster::RegisterServerRequest* request,
         cluster::RegisterServerReply* reply
     ) override {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        const std::uint32_t server_id =
-            request->server_id();
-
-        if (server_id >= servers_.size()) {
-            return Status(
-                StatusCode::INVALID_ARGUMENT,
-                "server_id is outside the configured range"
+        if (
+            request->partition_id() >= partition_count_ ||
+            request->replica_id() >= server_rf_
+        ) {
+            return grpc::Status(
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "partition_id/replica_id is outside topology"
             );
         }
 
-        ServerRecord& server = servers_[server_id];
+        const std::size_t flat_index =
+            static_cast<std::size_t>(
+                request->partition_id()
+            ) *
+            server_rf_ +
+            request->replica_id();
 
-        if (request->address() != server.address) {
-            return Status(
-                StatusCode::INVALID_ARGUMENT,
+        ReplicaRecord& record =
+            replicas_.at(flat_index);
+
+        if (request->address() != record.address) {
+            return grpc::Status(
+                grpc::StatusCode::INVALID_ARGUMENT,
                 "registration address does not match "
-                "the manager configuration"
+                "the configured server address"
             );
         }
 
         const bool first_registration =
-            !server.registered;
+            !record.registered;
 
-        server.registered = true;
+        record.registered = true;
 
         FillConfigLocked(reply->mutable_config());
 
         std::fprintf(
             stderr,
-            "%s server %u at %s; cluster ready=%s\n",
+            "%s partition %u replica %u at %s; ready=%s\n",
             first_registration
                 ? "Registered"
                 : "Re-registered",
-            server_id,
-            server.address.c_str(),
+            request->partition_id(),
+            request->replica_id(),
+            record.address.c_str(),
             AllRegisteredLocked() ? "true" : "false"
         );
 
-        return Status::OK;
+        return grpc::Status::OK;
     }
 
-    Status GetCluster(
-        ServerContext* /*context*/,
+    grpc::Status GetCluster(
+        grpc::ServerContext* /*context*/,
         const cluster::GetClusterRequest* /*request*/,
         cluster::GetClusterReply* reply
     ) override {
         std::lock_guard<std::mutex> lock(mutex_);
-
         FillConfigLocked(reply->mutable_config());
-
-        return Status::OK;
+        return grpc::Status::OK;
     }
 
 private:
     bool AllRegisteredLocked() const {
-        for (const ServerRecord& server : servers_) {
-            if (!server.registered) {
+        for (const ReplicaRecord& replica : replicas_) {
+            if (!replica.registered) {
                 return false;
             }
         }
@@ -177,128 +230,137 @@ private:
     ) const {
         config->Clear();
 
-        config->set_server_count(
-            static_cast<std::uint32_t>(
-                servers_.size()
-            )
-        );
-
+        config->set_partition_count(partition_count_);
+        config->set_server_rf(server_rf_);
         config->set_partitioning_scheme(
             cluster::PARTITIONING_SCHEME_FNV1A_64_MOD_N
         );
-
-        config->set_ready(
-            AllRegisteredLocked()
-        );
+        config->set_ready(AllRegisteredLocked());
 
         for (
-            std::uint32_t server_id = 0;
-            server_id < servers_.size();
-            ++server_id
+            std::uint32_t partition_id = 0;
+            partition_id < partition_count_;
+            ++partition_id
         ) {
-            const ServerRecord& record =
-                servers_[server_id];
+            for (
+                std::uint32_t replica_id = 0;
+                replica_id < server_rf_;
+                ++replica_id
+            ) {
+                const std::size_t flat_index =
+                    static_cast<std::size_t>(
+                        partition_id
+                    ) *
+                    server_rf_ +
+                    replica_id;
 
-            cluster::ServerInfo* output =
-                config->add_servers();
+                const ReplicaRecord& record =
+                    replicas_[flat_index];
 
-            output->set_server_id(server_id);
-            output->set_address(record.address);
-            output->set_registered(
-                record.registered
-            );
+                cluster::ReplicaInfo* output =
+                    config->add_replicas();
+
+                output->set_partition_id(partition_id);
+                output->set_replica_id(replica_id);
+                output->set_address(record.address);
+                output->set_registered(
+                    record.registered
+                );
+            }
         }
     }
 
-    std::vector<ServerRecord> servers_;
+    const std::uint32_t server_rf_;
+    std::uint32_t partition_count_ = 0;
+    std::vector<ReplicaRecord> replicas_;
     mutable std::mutex mutex_;
 };
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc != 8) {
         std::fprintf(
             stderr,
-            "Usage: %s <manager_listen_addr> "
-            "<server_addr_0,server_addr_1,...>\n",
+            "Usage: %s <replica_id> <manager_listen_addr> "
+            "<p2p_listen_addr> <peer_addrs> <server_rf> "
+            "<server_addrs> <backer_path>\n",
             argv[0]
         );
-
         return 1;
     }
 
-    const std::string manager_listen_addr = argv[1];
-    const std::string server_addresses_argument = argv[2];
-
     try {
-        std::vector<std::string> server_addresses =
-            ParseServerAddresses(
-                server_addresses_argument
-            );
+        const std::uint32_t replica_id =
+            ParseUint32(argv[1], "replica_id");
 
-        ClusterManagerServiceImpl service(
+        if (replica_id != 0) {
+            throw std::invalid_argument(
+                "manager replication is not implemented; "
+                "mandatory Project 3 uses only manager replica 0"
+            );
+        }
+
+        const std::string manager_listen = argv[2];
+
+        // These parameters remain accepted so the mandatory single manager
+        // is compatible with the official P3 recipe signature.
+        const std::string p2p_listen = argv[3];
+        const std::string peer_addresses = argv[4];
+        const std::uint32_t server_rf =
+            ParseUint32(argv[5], "server_rf");
+
+        std::vector<std::string> server_addresses =
+            ParseAddresses(argv[6]);
+
+        const std::string backer_path = argv[7];
+
+        ClusterManagerService service(
+            server_rf,
             server_addresses
         );
 
-        ServerBuilder builder;
-
+        grpc::ServerBuilder builder;
         builder.AddListeningPort(
-            manager_listen_addr,
+            manager_listen,
             grpc::InsecureServerCredentials()
         );
-
         builder.RegisterService(&service);
 
-        std::unique_ptr<Server> server(
+        std::unique_ptr<grpc::Server> server(
             builder.BuildAndStart()
         );
 
         if (!server) {
-            std::fprintf(
-                stderr,
-                "Failed to start manager on %s\n",
-                manager_listen_addr.c_str()
+            throw std::runtime_error(
+                "failed to start cluster manager on " +
+                manager_listen
             );
-
-            return 2;
         }
 
         std::fprintf(
             stderr,
-            "Cluster manager running on %s\n",
-            manager_listen_addr.c_str()
+            "Mandatory single manager running on %s\n"
+            "Configured partitions=%zu server_rf=%u replicas=%zu\n"
+            "Ignored manager-replication parameters: "
+            "p2p=%s peers=%s backer=%s\n",
+            manager_listen.c_str(),
+            server_addresses.size() / server_rf,
+            server_rf,
+            server_addresses.size(),
+            p2p_listen.c_str(),
+            peer_addresses.c_str(),
+            backer_path.c_str()
         );
-
-        std::fprintf(
-            stderr,
-            "Configured %zu partition servers:\n",
-            server_addresses.size()
-        );
-
-        for (
-            std::size_t server_id = 0;
-            server_id < server_addresses.size();
-            ++server_id
-        ) {
-            std::fprintf(
-                stderr,
-                "  server %zu: %s\n",
-                server_id,
-                server_addresses[server_id].c_str()
-            );
-        }
 
         server->Wait();
+        return 0;
     } catch (const std::exception& error) {
         std::fprintf(
             stderr,
             "Manager failed: %s\n",
             error.what()
         );
-
-        return 3;
+        return 2;
     }
-
-    return 0;
 }

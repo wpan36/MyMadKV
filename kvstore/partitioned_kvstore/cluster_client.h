@@ -3,39 +3,43 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cluster.grpc.pb.h"
 #include "cluster.pb.h"
 
 class ClusterClient final {
 public:
+    // manager_addresses is a comma-separated list. Mandatory P3 uses only
+    // manager replica 0, but accepting the whole list keeps the official
+    // P3 command-line interface unchanged.
     explicit ClusterClient(
-        const std::string& manager_address
+        const std::string& manager_addresses
     );
 
     ClusterClient(const ClusterClient&) = delete;
     ClusterClient& operator=(const ClusterClient&) = delete;
 
-    // Returns the static cluster configuration as soon as the
-    // manager becomes reachable. The cluster may not yet be ready.
     madkv::cluster::ClusterConfig
     GetClusterUntilAvailable();
 
-    // Waits until every configured partition server is registered.
     madkv::cluster::ClusterConfig
     GetClusterUntilReady();
 
-    // Retries registration while the manager is temporarily unavailable.
     madkv::cluster::ClusterConfig
     RegisterServerUntilSuccess(
-        std::uint32_t server_id,
+        std::uint32_t partition_id,
+        std::uint32_t replica_id,
         const std::string& public_address
     );
 
 private:
-    std::string manager_address_;
+    struct ManagerEndpoint {
+        std::string address;
+        std::unique_ptr<
+            madkv::cluster::ClusterManager::Stub
+        > stub;
+    };
 
-    std::unique_ptr<
-        madkv::cluster::ClusterManager::Stub
-    > stub_;
+    std::vector<ManagerEndpoint> managers_;
 };

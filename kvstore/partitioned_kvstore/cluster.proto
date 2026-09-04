@@ -7,22 +7,25 @@ enum PartitioningScheme {
   PARTITIONING_SCHEME_FNV1A_64_MOD_N = 1;
 }
 
-message ServerInfo {
-  uint32 server_id = 1;
-  string address = 2;
-  bool registered = 3;
+message ReplicaInfo {
+  uint32 partition_id = 1;
+  uint32 replica_id = 2;
+  string address = 3;
+  bool registered = 4;
 }
 
 message ClusterConfig {
-  uint32 server_count = 1;
-  PartitioningScheme partitioning_scheme = 2;
-  repeated ServerInfo servers = 3;
-  bool ready = 4;
+  uint32 partition_count = 1;
+  uint32 server_rf = 2;
+  PartitioningScheme partitioning_scheme = 3;
+  repeated ReplicaInfo replicas = 4;
+  bool ready = 5;
 }
 
 message RegisterServerRequest {
-  uint32 server_id = 1;
-  string address = 2;
+  uint32 partition_id = 1;
+  uint32 replica_id = 2;
+  string address = 3;
 }
 
 message RegisterServerReply {

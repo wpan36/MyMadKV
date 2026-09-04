@@ -558,3 +558,14 @@ target_compile_options(
         -Wextra
         -Wpedantic
 )
+
+# ---------------------------------------------------------------------------
+# Project 3 Step 5: wire final server binary to Raft-backed KV service
+# ---------------------------------------------------------------------------
+
+target_link_libraries(
+    kv_server
+    PRIVATE
+        replicated_kv_service
+        raft_core
+)
